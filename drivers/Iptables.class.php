@@ -9,54 +9,20 @@ class Iptables {
 
 	private $currentconf = false;
 
+	private $wlock = "";
+
+	public function __construct() {
+		if (version_compare(\PHP_VERSION, '5.6') >= 0) {
+			$this->wlock = "-w5 -W10000";
+		}
+	}
+
 	public function l($str) {
 		if (function_exists("fwLog")) {
 			fwLog($str);
 		} else {
 			print "LOG: $str\n";
 		}
-	}
-
-	public function getZonesDetails() {
-		// Returns array( "zonename" => array("interfaces" => .., "services" => .., "sources" => .. ), 
-		//   "zonename" => .. 
-		//   "zonename => ..
-		// );
-		$default = array("interfaces" => array(), "services" => array(), "sources" => array());
-		$zones = array("reject" => $default, "external" => $default, "other" => $default,
-			"internal" => $default, "trusted" => $default);
-
-		$current = $this->getCurrentIptables();
-
-		// Check IPv4 for the interface and config settings. IPv6 should be identical. But,
-		// if it's broken for some reason, it may not be providing useful information.
-
-		$allints = \FreePBX::Firewall()->getInterfaces();
-		if (!$this->isConfigured($current['ipv4'])) {
-			// Not Configured. Treat all our interfaces as 'Trusted'
-			$zones['trusted']['interfaces'] = array_keys($allints);
-			return $zones;
-		}
-
-		$i = $current['ipv4']['filter'];
-		// Find interfaces
-		foreach ($i['fpbxinterfaces'] as $row) {
-			if (!preg_match('/-i (.+) -j zone-(.+)/', $row, $out)) {
-				throw new \Exception("Unknown entry in interfaces - $row");
-			}
-			$zones[$out[2]]['interfaces'][] = $out[1];
-			unset($allints[$out[1]]);
-		}
-
-		// If there are any left, add them to trusted.
-		foreach ($allints as $int => $null) {
-			// Note that we ignore aliases.
-			if (strpos($int, ":")) {
-				continue;
-			}
-			$zones['trusted']['interfaces'][] = $int;
-		}
-		return $zones;
 	}
 
 	public function getKnownNetworks() {
@@ -141,10 +107,10 @@ class Iptables {
 		// Are we IPv6 or IPv4? Note, again, they're passed as ref, as we array_splice
 		// them later
 		if (filter_var($network, \FILTER_VALIDATE_IP, \FILTER_FLAG_IPV6)) {
-			$ipt = "/sbin/ip6tables";
+			$ipt = "/sbin/ip6tables ".$this->wlock;
 			$nets = &$current['ipv6']['filter']['fpbxnets'];
 		} elseif (filter_var($network, \FILTER_VALIDATE_IP, \FILTER_FLAG_IPV4)) {
-			$ipt = "/sbin/iptables";
+			$ipt = "/sbin/iptables ".$this->wlock;
 			$nets = &$current['ipv4']['filter']['fpbxnets'];
 		} else {
 			throw new \Exception("Not an IP address $network");
@@ -200,10 +166,10 @@ class Iptables {
 		// Are we IPv6 or IPv4? Note, again, they're passed as ref, as we array_splice
 		// them later
 		if (filter_var($network, \FILTER_VALIDATE_IP, \FILTER_FLAG_IPV6)) {
-			$ipt = "/sbin/ip6tables";
+			$ipt = "/sbin/ip6tables ".$this->wlock;
 			$nets = &$current['ipv6']['filter']['fpbxnets'];
 		} elseif (filter_var($network, \FILTER_VALIDATE_IP, \FILTER_FLAG_IPV4)) {
-			$ipt = "/sbin/iptables";
+			$ipt = "/sbin/iptables ".$this->wlock;
 			$nets = &$current['ipv4']['filter']['fpbxnets'];
 		} else {
 			throw new \Exception("Not an IP address $network");
@@ -242,12 +208,12 @@ class Iptables {
 		// Are we IPv6 or IPv4? Note, again, they're passed as ref, as we array_splice
 		// them later
 		if (filter_var($network, \FILTER_VALIDATE_IP, \FILTER_FLAG_IPV6)) {
-			$ipt = "/sbin/ip6tables";
+			$ipt = "/sbin/ip6tables ".$this->wlock;
 			$nets = &$current['ipv6']['filter']['fpbxnets'];
 			// Fake CIDR to add later, if we don't have one.
 			$fcidr = "/64";
 		} elseif (filter_var($network, \FILTER_VALIDATE_IP, \FILTER_FLAG_IPV4)) {
-			$ipt = "/sbin/iptables";
+			$ipt = "/sbin/iptables ".$this->wlock;
 			$nets = &$current['ipv4']['filter']['fpbxnets'];
 			$fcidr = "/32";
 		} else {
@@ -296,7 +262,7 @@ class Iptables {
 		$current = &$this->getCurrentIptables();
 
 		// Create a service!
-		$ipvers = array("ipv6" => "/sbin/ip6tables", "ipv4" => "/sbin/iptables");
+		$ipvers = array("ipv6" => "/sbin/ip6tables ".$this->wlock, "ipv4" => "/sbin/iptables ".$this->wlock);
 		foreach ($ipvers as $ipv => $ipt) {
 			$changed = false;
 			// Service name is 'fpbxsvc-$service'
@@ -318,7 +284,14 @@ class Iptables {
 					foreach ($ports as $tmparr) {
 						$protocol = $tmparr['protocol'];
 						$port = $tmparr['port'];
-						$param = "-p $protocol -m $protocol --dport $port -j ACCEPT";
+						$ratelimit = isset($tmparr['ratelimit']);
+
+						if ($ratelimit) {
+							$param = "-p $protocol -m $protocol --dport $port -j fpbxratelimit";
+						} else {
+							$param = "-p $protocol -m $protocol --dport $port -j ACCEPT";
+						}
+
 						if (isset($flipped[$param])) {
 							unset($flipped[$param]);
 						} else {
@@ -355,7 +328,14 @@ class Iptables {
 					foreach ($ports as $arr) {
 						$protocol = $arr['protocol'];
 						$port = $arr['port'];
-						$param = "-p $protocol -m $protocol --dport $port -j ACCEPT";
+
+						// If this port is rate limited, use that rather than ACCEPT
+						if (isset($arr['ratelimit'])) {
+							$param = "-p $protocol -m $protocol --dport $port -j fpbxratelimit";
+						} else {
+							$param = "-p $protocol -m $protocol --dport $port -j ACCEPT";
+						}
+
 						$current[$ipv]['filter'][$name][] = $param;
 						$cmd = "$ipt -A $name $param";
 						$this->l($cmd);
@@ -396,7 +376,7 @@ class Iptables {
 
 		// Now flush it completely from iptables, as well
 		$current = &$this->getCurrentIptables();
-		$ipvers = array("ipv6" => "/sbin/ip6tables", "ipv4" => "/sbin/iptables");
+		$ipvers = array("ipv6" => "/sbin/ip6tables ".$this->wlock, "ipv4" => "/sbin/iptables ".$this->wlock);
 
 		$svc = "fpbxsvc-$service";
 
@@ -425,7 +405,7 @@ class Iptables {
 		$name = "fpbxsvc-$service";
 
 		// Check to make sure we know about this service.
-		$ipvers = array("ipv6" => "/sbin/ip6tables", "ipv4" => "/sbin/iptables");
+		$ipvers = array("ipv6" => "/sbin/ip6tables ".$this->wlock, "ipv4" => "/sbin/iptables ".$this->wlock);
 		foreach ($ipvers as $ipv => $ipt) {
 			if (!isset($current[$ipv]['filter'][$name])) {
 				throw new \Exception("Can't add a $ipv service for $name, it doesn't exist");
@@ -497,7 +477,7 @@ class Iptables {
 		$p = "-i $iface -j zone-";
 
 		// Remove from both ipv4 and ipv6.
-		$ipvers = array("ipv6" => "/sbin/ip6tables", "ipv4" => "/sbin/iptables");
+		$ipvers = array("ipv6" => "/sbin/ip6tables ".$this->wlock, "ipv4" => "/sbin/iptables ".$this->wlock);
 		foreach ($ipvers as $ipv => $ipt) {
 			$interfaces = &$current[$ipv]['filter']['fpbxinterfaces'];
 			foreach ($interfaces as $i => $n) {
@@ -515,6 +495,7 @@ class Iptables {
 					// break;
 				}
 			}
+
 			// Now we can just add it, if we're not deleting it
 			if ($newzone) {
 				$this->checkTarget("zone-$newzone");
@@ -526,8 +507,51 @@ class Iptables {
 			}
 		}
 
-		$net = new \FreePBX\modules\Firewall\Network;
-		$net->updateInterfaceZone($iface, $newzone);
+		// If nat isn't enabled, fix it.
+		if (empty($current['ipv4']['nat']) || !is_array($current['ipv4']['nat'])) {
+			$current['ipv4']['nat'] = array();
+		}
+
+		// If this is an 'INTERNET' (external) zone, mark packets that are
+		// forwared with a destination of that interface eligible
+		// for masq. Note that only ipv4 does NAT, it's ludicrous to NAT
+		// IPv6, and it's barely even supported until 4.0+ kernels.
+
+		if ($newzone !== "external") {
+			$nat = false;
+		} else {
+			$nat = true;
+		}
+
+		$foundrule = false;
+		$rule = "-o $iface -j MARK --set-xmark 0x2/0x2";
+
+		// If there's no masq-output entries, it won't exist.
+		if (empty($current['ipv4']['nat']['masq-output'])) {
+			$current['ipv4']['nat']['masq-output'] = array();
+		}
+
+		foreach ($current['ipv4']['nat']['masq-output'] as $lineno => $line) {
+			if ($line == $rule) {
+				$foundrule = $lineno;
+				break;
+			}
+		}
+
+		unset($output);
+		// If we didn't find the rule, and we need it, add it.
+		if ($foundrule === false && $nat) {
+			$cmd = "/sbin/iptables ".$this->wlock." -t nat -A masq-output $rule";
+			$this->l($cmd);
+			exec($cmd, $output, $ret);
+			$current['ipv4']['nat']['masq-output'][] = $rule;
+		} elseif ($foundrule !== false && !$nat) {
+			// We found it, but it shoudn't be there. Delete it.
+			$cmd = "/sbin/iptables ".$this->wlock." -t nat -D masq-output $rule";
+			$this->l($cmd);
+			exec($cmd, $output, $ret);
+			array_splice($current['ipv4']['nat']['masq-output'], $foundrule, 1);
+		}
 	}
 
 	// Root process
@@ -546,7 +570,7 @@ class Iptables {
 		$this->checkTarget("fpbx-rtp");
 		
 		$current = &$this->getCurrentIptables();
-		$ipvers = array("ipv6" => "/sbin/ip6tables", "ipv4" => "/sbin/iptables");
+		$ipvers = array("ipv6" => "/sbin/ip6tables ".$this->wlock, "ipv4" => "/sbin/iptables ".$this->wlock);
 		foreach ($ipvers as $ipv => $ipt) {
 			$me = &$current[$ipv]['filter']['fpbx-rtp'];
 			$foundrtp = false;
@@ -599,7 +623,7 @@ class Iptables {
 		$this->checkTarget("fpbxsignalling");
 		$ports = $rules['smartports']['signalling'];
 		$current = &$this->getCurrentIptables();
-		$ipvers = array("ipv6" => "/sbin/ip6tables", "ipv4" => "/sbin/iptables");
+		$ipvers = array("ipv6" => "/sbin/ip6tables ".$this->wlock, "ipv4" => "/sbin/iptables ".$this->wlock);
 		foreach ($ipvers as $ipv => $ipt) {
 			$me = &$current[$ipv]['filter']['fpbxsignalling'];
 			if (!is_array($me)) {
@@ -675,6 +699,12 @@ class Iptables {
 		// Run through the hosts and add them to what we WANT our chains to be
 		$wanted = array("4" => array(), "6" => array());
 		foreach ($hosts as $addr) {
+			// Make sure that addr doesn't have any leading or trailing whitespace
+			$addr = trim($addr);
+			if (!$addr) {
+				// It's blank, ignore
+				continue;
+			}
 			// This can be a network, too!
 			if (strpos($addr, "/")) {
 				// It's a network
@@ -689,15 +719,15 @@ class Iptables {
 			} elseif (filter_var($host, \FILTER_VALIDATE_IP, \FILTER_FLAG_IPV4)) {
 				$wanted[4][] = $addr;
 			} else {
-				throw new \Exception("Unknown host address $addr");
+				throw new \Exception("Unknown host address '$addr'");
 			}
 		}
 
 		// And now add or remove them as neccesary. We do a bit of
 		// array mangling so I can avoid code duplication.
 
-		$smarthosts = array("ipv6" => array("ipt" => "/sbin/ip6tables", "targets" => $wanted[6], "prefix" => "128"),
-			"ipv4" => array("ipt" => "/sbin/iptables", "targets" => $wanted[4], "prefix" => "32"),
+		$smarthosts = array("ipv6" => array("ipt" => "/sbin/ip6tables ".$this->wlock, "targets" => $wanted[6], "prefix" => "128"),
+			"ipv4" => array("ipt" => "/sbin/iptables ".$this->wlock, "targets" => $wanted[4], "prefix" => "32"),
 		);
 
 		foreach ($smarthosts as $ipv => $tmparr) {
@@ -784,8 +814,8 @@ class Iptables {
 
 		// And now add or remove them as neccesary. We do a bit of
 		// array mangling so I can avoid code duplication.
-		$ipvers = array("ipv6" => array("ipt" => "/sbin/ip6tables", "targets" => $wanted[6], "prefix" => "128"),
-			"ipv4" => array("ipt" => "/sbin/iptables", "targets" => $wanted[4], "prefix" => "32"),
+		$ipvers = array("ipv6" => array("ipt" => "/sbin/ip6tables ".$this->wlock, "targets" => $wanted[6], "prefix" => "128"),
+			"ipv4" => array("ipt" => "/sbin/iptables ".$this->wlock, "targets" => $wanted[4], "prefix" => "32"),
 		);
 
 		$current = &$this->getCurrentIptables();
@@ -841,14 +871,23 @@ class Iptables {
 
 		$wanted = array("4" => array(), "6" => array());
 
-		// $blacklist is array("ip.range.here/cidr" => false, "hostname" => array("ip", "ip", "ip"), ...);
+		// $blacklist is array("ip.range.here(optional: /cidr)" => false, "hostname" => array("ip", "ip", "ip"), ...);
 		foreach ($blacklist as $entry => $val) {
 			if ($val === false) {
 				// It's a network.
 				$net = explode("/", $entry);
 				if (!isset($net[1])) {
-					// Well that's just crazy.
-					continue;
+					// No CIDR?  Is it an IP address?
+					if (filter_var($net[0], \FILTER_VALIDATE_IP, \FILTER_FLAG_IPV6)) {
+						// Yes. It's IPv6
+						$net[1] = "128";
+					} elseif (filter_var($net[0], \FILTER_VALIDATE_IP, \FILTER_FLAG_IPV4)) {
+						// Yes. It's IPv4
+						$net[1] = "32";
+					} else {
+						// Well that's just crazy.
+						continue;
+					}
 				}
 				$addr = $net[0];
 				if (filter_var($addr, \FILTER_VALIDATE_IP, \FILTER_FLAG_IPV6)) {
@@ -880,8 +919,8 @@ class Iptables {
 
 		// And now add or remove them as neccesary. We do a bit of
 		// array mangling so I can avoid code duplication.
-		$ipvers = array("ipv6" => array("ipt" => "/sbin/ip6tables", "targets" => $wanted[6], "prefix" => "128"),
-			"ipv4" => array("ipt" => "/sbin/iptables", "targets" => $wanted[4], "prefix" => "32"),
+		$ipvers = array("ipv6" => array("ipt" => "/sbin/ip6tables ".$this->wlock, "targets" => $wanted[6], "prefix" => "128"),
+			"ipv4" => array("ipt" => "/sbin/iptables ".$this->wlock, "targets" => $wanted[4], "prefix" => "32"),
 		);
 
 		$current = &$this->getCurrentIptables();
@@ -951,8 +990,8 @@ class Iptables {
 
 		// And now add or remove them as neccesary. We do a bit of
 		// array mangling so I can avoid code duplication.
-		$ipvers = array("ipv6" => array("ipt" => "/sbin/ip6tables", "targets" => $wanted[6], "prefix" => "128"),
-			"ipv4" => array("ipt" => "/sbin/iptables", "targets" => $wanted[4], "prefix" => "32"),
+		$ipvers = array("ipv6" => array("ipt" => "/sbin/ip6tables ".$this->wlock, "targets" => $wanted[6], "prefix" => "128"),
+			"ipv4" => array("ipt" => "/sbin/iptables ".$this->wlock, "targets" => $wanted[4], "prefix" => "32"),
 		);
 
 		$current = &$this->getCurrentIptables();
@@ -1003,7 +1042,7 @@ class Iptables {
 	// Root process
 	public function setRejectMode($drop = false, $log = false) {
 		$current = &$this->getCurrentIptables();
-		$ipvers = array("ipv6" => "/sbin/ip6tables", "ipv4" => "/sbin/iptables");
+		$ipvers = array("ipv6" => "/sbin/ip6tables ".$this->wlock, "ipv4" => "/sbin/iptables ".$this->wlock);
 		foreach ($ipvers as $v => $iptcmd) {
 			$dropid = 0;
 			// Should we log?
@@ -1049,7 +1088,7 @@ class Iptables {
 
 	// Driver Specific iptables stuff
 	// Root process
-	private function &getCurrentIptables() {
+	public function &getCurrentIptables() {
 		if (!$this->currentconf) {
 			// Am I root?
 			if (posix_getuid() === 0) {
@@ -1134,6 +1173,22 @@ class Iptables {
 			}
 			// unset ($rules[$name]);
 		}
+		// Add MASQ rules. They're hardcoded here, because it's just simpler.
+		// Note we only NAT IPv4, not IPv6. If you want to nat IPv6, you're doing it wrong.
+		$rules = array(
+			"-t nat -N masq-input",
+			"-t nat -N masq-output",
+			"-t nat -A POSTROUTING -j masq-input",  // sets bit 1 if elegible for masq
+			"-t nat -A masq-input  -j MARK --set-xmark 0x1/0xffffffff", // TODO: Validate source. Currently allow all.
+			"-t nat -A POSTROUTING -j masq-output", // sets bit 2 if elegible for masq
+			"-t nat -A POSTROUTING -m mark --mark 0x3/0x3 -j MASQUERADE", // if 1&2 are set, masq
+		);
+
+		foreach ($rules as $r) {
+			$cmd = "/sbin/iptables ".$this->wlock." $r";
+			$this->l($cmd);
+			exec($cmd);
+		}
 		return true;
 	}
 
@@ -1144,9 +1199,9 @@ class Iptables {
 		// Default sanity rules. 
 		// 1: Always allow all lo traffic, no matter what.
 		$retarr['fpbxfirewall'][]= array("int" => "lo", "jump" => "ACCEPT");
-		// 2: Allow related/established - TCP all, but udp needs a bit more care.
+		// 2: Allow related/established - TCP all, but udp needs to be managed AFTER
+		// we check for any other traffic we care about.
 		$retarr['fpbxfirewall'][]= array("proto" => "tcp", "other" => "-m state --state RELATED,ESTABLISHED", "jump" => "ACCEPT");
-		$retarr['fpbxfirewall'][]= array("proto" => "udp", "sport" => "1:1024", "other" => "-m state --state RELATED,ESTABLISHED", "jump" => "ACCEPT");
 		// 3: Always allow ICMP (no, really, you always want to allow ICMP, stop thinking blocking
 		// it is a good idea)
 		$retarr['fpbxfirewall'][]= array("ipvers" => 4, "proto" => "icmp", "jump" => "ACCEPT");
@@ -1156,6 +1211,8 @@ class Iptables {
 		$retarr['fpbxfirewall'][]= array("other" => "-m pkttype --pkt-type multicast", "jump" => "ACCEPT");
 		// This ensures we can act as a DHCP server if we want to.
 		$retarr['fpbxfirewall'][]= array("proto" => "udp", "dport" => "67:68", "sport" => "67:68", "jump" => "ACCEPT");
+		// IPv6 Link-Local DHCP Traffic must be allowed
+		$retarr['fpbxfirewall'][]= array("ipvers" => 6, "proto" => "udp", "dport" => "546:547", "sport" => "546:547", "src" => "fe80::/64", "jump" => "ACCEPT");
 		// Check if this is RTP traffic. This is a high priority tag, so it's up the top.
 		$retarr['fpbxfirewall'][]= array("jump" => "fpbx-rtp");
 
@@ -1180,15 +1237,30 @@ class Iptables {
 		// If this is a VoIP Signalling packet from an unknown host, and it's eligible for
 		// RFW, then send it off there.
 		$retarr['fpbxfirewall'][] = array("other" => "-m mark --mark 0x2/0x2", "jump" => "fpbxrfw");
+		// Now, it may be other 'related' UDP traffic (tftp, for example)
+		$retarr['fpbxfirewall'][]= array("proto" => "udp", "other" => "-m state --state RELATED,ESTABLISHED", "jump" => "ACCEPT");
 		// Otherwise, log and drop.
 		$retarr['fpbxfirewall'][] = array("jump" => "fpbxlogdrop");
 
-		// Our 'trusted' zone is always allow everything.
+		// Our 'trusted' zone is always allowed access to everything
 		$retarr['zone-trusted'][] = array("jump" => "ACCEPT");
+
+		// Mark traffic that comes in from other zones, so that they can be handled
+		// differently if needed (Rate limiting cares about zone-internal, and checks
+		// for mark 0x4). Nothing else is using it at the moment, but it is left here
+		// for expansion by third parties.
+		$retarr['zone-internal'][] = array("other" => "-m mark --mark 0x4/0x4");
+		$retarr['zone-other'][] = array("other" => "-m mark --mark 0x8/0x8");
+		$retarr['zone-external'][] = array("other" => "-m mark --mark 0x10/0x10");
 
 		// VoIP Rate limiting happens here. If they've made it here, they're an unknown host
 		// sending VoIP *signalling* here. We want to give them a bit of slack, to make sure
 		// it's not a dynamic IP address of a known good client.
+
+		// Before we do anything, if this has already been discovered by the monitoring
+		// daemon, let it access this port for up to 90 seconds. This is enough time for the
+		// firewall daemon to discover it in asterisk and add it to the proper tables.
+		$retarr['fpbxrfw'][] = array("other" => "-m recent --rcheck --seconds 90 --hitcount 1 --name WHITELIST --rsource", "jump" => "ACCEPT");
 
 		// To start with, we ensure that we keep track of ALL rfw attempts.
 		$retarr['fpbxrfw'][] = array("other" => "-m recent --set --name REPEAT --rsource");
@@ -1224,25 +1296,63 @@ class Iptables {
 		// We drop rather than reject, as it slows attack scripts down, and they tend to give up quicker 
 		// after a bunch of timeouts than they do with an authoritative 'refused'.
 		$retarr['fpbxattacker'][] = array("other" => "-m recent --set --name ATTACKER --rsource");
-		$retarr['fpbxattacker'][] = array("jump" => "LOG", "append" => " --log-prefix 'attacker: '");
+		// No longer logging attackers, there's too many.
+		// $retarr['fpbxattacker'][] = array("jump" => "LOG", "append" => " --log-prefix 'attacker: '");
 		$retarr['fpbxattacker'][] = array("jump" => "DROP");
 
 		// We tag this IP so that monitoring knows that they were previously blocked. Reject, rather
 		// than drop, for phones.
 		$retarr['fpbxshortblock'][] = array("other" => "-m recent --set --name CLAMPED --rsource");
-		$retarr['fpbxshortblock'][] = array("jump" => "LOG", "append" => " --log-prefix 'clamped: '");
+		// No longer logging attackers, there's too many.
+		// $retarr['fpbxshortblock'][] = array("jump" => "LOG", "append" => " --log-prefix 'clamped: '");
 		$retarr['fpbxshortblock'][] = array("jump" => "REJECT");
 
-		// Don't log normally rejected packets for the moment. No-one's using them.
-		// $retarr['fpbxlogdrop'][] = array("jump" => "LOG", "append" => " --log-prefix 'logdrop: '");
 		$retarr['fpbxlogdrop'][] = array("jump" => "REJECT");
 
-		// Known Registrations are allowed to access signalling, UCP, Zulu, and Provisioning ports
+		// TCP Rate limiting. We use REPEAT and DISCOVERED as names, so they are visible
+		// in the UI. Also, we don't want an attacker to try to connect to our SIP ports
+		// after being blocked from another service!
+
+		// If this packet is from an INTERNAL network, don't rate limit it.
+		$retarr['fpbxratelimit'][] = array("other" => "-m mark --mark 0x4/0x4", "jump" => "ACCEPT");
+
+		// If this has already been discovered by the monitoring daemon, let it access this
+		// port for up to 90 seconds. This is enough time for the firewall daemon to discover
+		// it in asterisk and add it to the proper tables.
+		$retarr['fpbxratelimit'][] = array("other" => "-m recent --rcheck --seconds 90 --hitcount 1 --name WHITELIST --rsource", "jump" => "ACCEPT");
+
+		// On a SYN packet, add it to our watch list
+		$retarr['fpbxratelimit'][] = array("other" => "-m state --state NEW -m recent --set --name REPEAT --rsource");
+		// Note DISCOVERED is only for the UI
+		$retarr['fpbxratelimit'][] = array("other" => "-m state --state NEW -m recent --set --name DISCOVERED --rsource");
+
+		$retarr['fpbxratelimit'][] = array("jump" => "LOG");
+		// Has this IP already been marked as an attacker? If so, you're still one, go away.
+		$retarr['fpbxratelimit'][] = array("other" => "-m recent --rcheck --seconds 86400 --hitcount 1 --name ATTACKER --rsource", "jump" => "fpbxattacker");
+
+		// TCP Packets are a bit more picky. We allow up to 10 connection requests per 60 seconds
+		// before we add them to the short block. But more than 50 in a 1 hour period, or 100 in
+		// a 24 hour period is an attacker. Seriously, how bad is your network?
+		$retarr['fpbxratelimit'][] = array("other" => "-m recent --rcheck --seconds 86400 --hitcount 100 --name REPEAT --rsource", "jump" => "fpbxattacker");
+		$retarr['fpbxratelimit'][] = array("other" => "-m recent --rcheck --seconds 3600 --hitcount 50 --name REPEAT --rsource", "jump" => "fpbxattacker");
+		$retarr['fpbxratelimit'][] = array("other" => "-m recent --rcheck --seconds 60 --hitcount 10 --name REPEAT --rsource", "jump" => "fpbxshortblock");
+
+
+		// If they made it past here, they're all good.
+		$retarr['fpbxratelimit'][] = array("jump" => "ACCEPT");
+
+		// As this IP is known about, remove it from any tables they may be in (Note that DISCOVERED is only
+		// used for the UI, so don't remove it from that)
+		$retarr['fpbxknownreg'][] = array("other" => "-m recent --remove --rsource --name REPEAT");
+		$retarr['fpbxknownreg'][] = array("other" => "-m recent --remove --rsource --name ATTACKER");
+		// Known Registrations are allowed to access signalling, UCP, Zulu, and Provisioning ports.
 		$retarr['fpbxknownreg'][] = array("other" => "-m mark --mark 0x1/0x1", "jump" => "ACCEPT");
 		$retarr['fpbxknownreg'][] = array("jump" => "fpbxsvc-ucp");
 		$retarr['fpbxknownreg'][] = array("jump" => "fpbxsvc-zulu");
 		$retarr['fpbxknownreg'][] = array("jump" => "fpbxsvc-restapps");
+		$retarr['fpbxknownreg'][] = array("jump" => "fpbxsvc-restapps_ssl");
 		$retarr['fpbxknownreg'][] = array("jump" => "fpbxsvc-provis");
+		$retarr['fpbxknownreg'][] = array("jump" => "fpbxsvc-provis_ssl");
 
 		return $retarr;
 	}
@@ -1359,10 +1469,12 @@ class Iptables {
 			}
 		}
 		if (isset($arr['src'])) {
-			// TODO: Check with ipv6
-			list($src) = explode(":", $arr['src']); // eg, $src = explode(":", $arr['src'])[0];
-			if (strpos($src, "/") === false) {
-				$src .= "/32";
+			if (filter_var($arr['src'], \FILTER_VALIDATE_IP, \FILTER_FLAG_IPV6)) {
+				$src = $arr['src']."/128";
+			} elseif (filter_var($arr['src'], \FILTER_VALIDATE_IP, \FILTER_FLAG_IPV4)) {
+				$src = $arr['src']."/32";
+			} else {
+				$src = $arr['src'];
 			}
 			$str .= "-s $src ";
 		}
@@ -1403,14 +1515,14 @@ class Iptables {
 		$parsed = $this->parseFilter($arr);
 
 		// IPv4
-		$cmd = "/sbin/iptables -I $chain $parsed";
+		$cmd = "/sbin/iptables ".$this->wlock." -I $chain $parsed";
 		$this->l($cmd);
 		exec($cmd, $output, $ret);
 		// Add it to our local array
 		array_unshift($this->currentconf['ipv4']['filter'][$chain], $parsed);
 
 		// IPv6
-		$cmd = "/sbin/ip6tables -I $chain $parsed";
+		$cmd = "/sbin/ip6tables ".$this->wlock." -I $chain $parsed";
 		$this->l($cmd);
 		exec($cmd, $output, $ret);
 		// Add it to our local array
@@ -1434,7 +1546,7 @@ class Iptables {
 		$parsed = $this->parseFilter($arr);
 
 		if ($arr['ipvers'] == 6 || $arr['ipvers'] == "both") {
-			$cmd = "/sbin/ip6tables -A $chain $parsed";
+			$cmd = "/sbin/ip6tables ".$this->wlock." -A $chain $parsed";
 			$this->l($cmd);
 			exec($cmd, $output, $ret);
 			if ($ret === 0) {
@@ -1442,7 +1554,7 @@ class Iptables {
 			}
 		}
 		if ($arr['ipvers'] == 4 || $arr['ipvers'] == "both") {
-			$cmd = "/sbin/iptables -A $chain $parsed";
+			$cmd = "/sbin/iptables ".$this->wlock." -A $chain $parsed";
 			$this->l($cmd);
 			exec($cmd, $output, $ret);
 			if ($ret === 0) {
@@ -1476,7 +1588,7 @@ class Iptables {
 		// It doesn't exist.
 
 		// IPv4
-		$cmd = "/sbin/iptables -N ".escapeshellcmd($target);
+		$cmd = "/sbin/iptables ".$this->wlock." -N ".escapeshellcmd($target);
 		$this->l($cmd);
 		exec($cmd, $output, $ret);
 		if ($ret == 0) {
@@ -1485,7 +1597,7 @@ class Iptables {
 
 		$output = null;
 		// IPv6
-		$cmd = "/sbin/ip6tables -N ".escapeshellcmd($target);
+		$cmd = "/sbin/ip6tables ".$this->wlock." -N ".escapeshellcmd($target);
 		$this->l($cmd);
 		exec($cmd, $output, $ret);
 		if ($ret == 0) {
@@ -1498,7 +1610,7 @@ class Iptables {
 		$current = &$this->getCurrentIptables();
 
 		// Reject on both ipv6 and ipv4
-		$ipvers = array("ipv6" => "/sbin/ip6tables", "ipv4" => "/sbin/iptables");
+		$ipvers = array("ipv6" => "/sbin/ip6tables ".$this->wlock, "ipv4" => "/sbin/iptables ".$this->wlock);
 		$svcname = "rejsvc-$name";
 
 		// Make sure our target exists
@@ -1557,7 +1669,7 @@ class Iptables {
 	public function removeFromReject($name) {
 		$current = &$this->getCurrentIptables();
 
-		$ipvers = array("ipv6" => "/sbin/ip6tables", "ipv4" => "/sbin/iptables");
+		$ipvers = array("ipv6" => "/sbin/ip6tables ".$this->wlock, "ipv4" => "/sbin/iptables ".$this->wlock);
 		$svcname = "rejsvc-$name";
 
 		foreach ($ipvers as $ipv => $ipt) {

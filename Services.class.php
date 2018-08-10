@@ -11,7 +11,7 @@ class Services {
 	public function __construct() {
 		// Can't define arrays in some versions of PHP.
 		$this->coreservices = array("ssh", "http", "https", "ucp", "pjsip", "chansip", "iax", "webrtc");
-		$this->extraservices = array("zulu", "isymphony", "provis", "vpn", "restapps", "xmpp", "ftp", "tftp", "nfs", "smb");
+		$this->extraservices = array("zulu", "isymphony", "provis", "provis_ssl", "vpn", "restapps", "restapps_ssl", "xmpp", "ftp", "tftp", "nfs", "smb");
 
 		$this->allservices = array_merge($this->coreservices, $this->extraservices);
 	}
@@ -77,7 +77,7 @@ class Services {
 		$retarr = array(
 			"name" => _("Web Management"),
 			"defzones" => array("internal"),
-			"descr" => _("Web management interface for FreePBX. This is the http, not https (secure) interface."),
+			"descr" => _("Web management interface for your PBX. This is the http, not https (secure) interface."),
 			"fw" => array(array("protocol" => "tcp", "port" => 80)),
 		);
 
@@ -85,7 +85,7 @@ class Services {
 		// Ask sysadmin for the REAL port of the admin interface
 		try {
 			$ports = \FreePBX::Sysadmin()->getPorts();
-			if (isset($ports['acp']) && $ports['acp'] > 80) {
+			if (isset($ports['acp']) && $ports['acp'] >= 80) {
 				$retarr['fw'][0]['port'] = $ports['acp'];
 			}
 		} catch (\Exception $e) {
@@ -97,14 +97,14 @@ class Services {
 	private function getSvc_https() {
 		$retarr = array(
 			"name" => _("Web Management (Secure)"),
-			"defzones" => array("external", "internal"),
-			"descr" => _("Web management interface for FreePBX. This is the https interface."),
+			"defzones" => array("internal"),
+			"descr" => _("Web management interface for your PBX. This is the https interface."),
 			"fw" => array(array("protocol" => "tcp", "port" => 443)),
 			"noreject" => true,
 		);
 		try {
 			$ports = \FreePBX::Sysadmin()->getPorts();
-			if (isset($ports['sslacp']) && $ports['sslacp'] > 80) {
+			if (isset($ports['sslacp']) && $ports['sslacp'] >= 80) {
 				$retarr['fw'][0]['port'] = $ports['sslacp'];
 			}
 		} catch (\Exception $e) {
@@ -117,7 +117,7 @@ class Services {
 		$retarr = array(
 			"name" => _("UCP"),
 			"defzones" => array("external", "other", "internal"),
-			"descr" => _("UCP - User Control Panel - is the main user interface to FreePBX, and allows people to control their phone. Note that if you want to allow users to use their web browsers to make calls through UCP you also need to add WebRTC to the same zone(s)."),
+			"descr" => _("UCP - User Control Panel - is the main user interface to the PBX, and allows people to control their phone. Note that if you want to allow users to use their web browsers to make calls through UCP you also need to add WebRTC to the same zone(s)."),
 			"fw" => array(array("protocol" => "tcp", "port" => 81)),
 		);
 		// TODO: This is not portable for machines that don't have sysadmin.
@@ -127,10 +127,10 @@ class Services {
 			// Sysadmin is installed
 			$retarr['fw'] = array();
 
-			if (isset($ports['ucp']) && $ports['ucp'] !== 'disabled' && $ports['ucp'] > 80) {
+			if (isset($ports['ucp']) && $ports['ucp'] !== 'disabled' && $ports['ucp'] >= 80) {
 				$retarr['fw'][] = array("protocol" => "tcp", "port" => $ports['ucp']);
 			}
-			if (isset($ports['sslucp']) && $ports['sslucp'] !== 'disabled' && $ports['sslucp'] > 80) {
+			if (isset($ports['sslucp']) && $ports['sslucp'] !== 'disabled' && $ports['sslucp'] >= 80) {
 				$retarr['fw'][] = array("protocol" => "tcp", "port" => $ports['sslucp']);
 			}
 			// Were there any ports discovered?
@@ -138,11 +138,12 @@ class Services {
 				// No port are assigned to restapps, it's not enabled in sysadmin
 				$retarr['descr'] = _("Dedicated UCP access is disabled in Sysadmin Port Management");
 				$retarr['disabled'] = true;
+				// Don't return the nodejs stuff if UCP is disabled
+				return $retarr;
 			}
-			// Don't return the nodejs stuff if UCP is disabled
-			return $retarr;
 		} catch (\Exception $e) {
-			// ignore
+			// Ignore. User will have to manually add whatever ports
+			// they have configured UCP to listen on.
 		}
 
 		// Add nodejs listen port, if it's installed.
@@ -170,7 +171,7 @@ class Services {
 
 		$retarr = array(
 			"name" => _("WebRTC"),
-			"defzones" => array("reject"),
+			"defzones" => array("internal"),
 			"descr" => _("WebRTC is used by UCP (and other services) to enable calls to be made via a web browser."),
 			"fw" => array(
 				array("protocol" => "tcp", "port" => $websocket),
@@ -183,9 +184,10 @@ class Services {
 	private function getSvc_zulu() {
 		// See if Zulu is installed and licenced.
 		$retarr = array(
-			"name" => _("Zulu UC "),
-			"defzones" => array("internal"),
-			"descr" => _("Zulu UC delivers Outlook and browser integration for FreePBX. Note that the Zulu port is <strong>automatically opened</strong> to any registered clients. It is unlikely you need to change this."),
+			"name" => _("Zulu UC"),
+			"defzones" => array("external", "other", "internal"),
+			// Taken from https://www.freepbx.org/store/zulu/
+			"descr" => _("Zulu UC Desktop and softphone integration unifies the most popular business communication tools & applications enhancing user productivity and mobility. Zulu uses a token-based secure authentication method and is safe to expose to the public internet, as it rate limits (and then blocks) attackers. Note that rate limits are not applied to clients in the 'Trusted' or 'Internal' zones."),
 		);
 
 		$zuluport = false;
@@ -206,7 +208,7 @@ class Services {
 			return $retarr;
 		}
 
-		$retarr['fw'] = array(array("protocol" => "tcp", "port" => $zuluport));
+		$retarr['fw'] = array(array("protocol" => "tcp", "port" => $zuluport, "ratelimit" => true));
 		return $retarr;
 	}
 
@@ -218,8 +220,8 @@ class Services {
 			"fw" => array(),
 		);
 
-		if (\FreePBX::Firewall()->getConfig("pjsip", "rfw")) {
-			$retarr['descr'] .= "<div class='well'>"._("This protocol is being managed by the Responsive Firewall. You almost certainly don't want to explicitly enable any zones, but the option is available to advanced users. Note that hosts in the Trusted Zone will always be allowed full access")."</div>";
+		if (\FreePBX::Firewall()->getConfig('responsivefw') && \FreePBX::Firewall()->getConfig("pjsip", "rfw")) {
+			$retarr['descr'] .= "<div class='well'>"._("This protocol is being managed by the Responsive Firewall. You <strong>should not</strong> enable access from the 'Internet' zone, or Responsive Firewall will be bypassed.")."</div>";
 		}
 
 		$driver = \FreePBX::Config()->get('ASTSIPDRIVER');
@@ -275,8 +277,8 @@ class Services {
 			"fw" => array(),
 		);
 
-		if (\FreePBX::Firewall()->getConfig("chansip", "rfw")) {
-			$retarr['descr'] .= "<div class='well'>"._("This protocol is being managed by the Responsive Firewall. You almost certainly don't want to explicitly enable any zones, but the option is available to advanced users. Note that hosts in the Trusted Zone will always be allowed full access")."</div>";
+		if (\FreePBX::Firewall()->getConfig('responsivefw') && \FreePBX::Firewall()->getConfig("chansip", "rfw")) {
+			$retarr['descr'] .= "<div class='well'>"._("This protocol is being managed by the Responsive Firewall. You <strong>should not</strong> enable access from the 'Internet' zone, or Responsive Firewall will be bypassed.")."</div>";
 		}
 
 		$driver = \FreePBX::Config()->get('ASTSIPDRIVER');
@@ -324,8 +326,8 @@ class Services {
 			// If you're using IAX on a non standard port, stop it. You're doing it wrong.
 			"fw" => array(array("protocol" => "udp", "port" => 4569)),
 		);
-		if (\FreePBX::Firewall()->getConfig("iax", "rfw")) {
-			$retarr['descr'] .= "<div class='well'>"._("This protocol is being managed by the Responsive Firewall. There is no need to explicitly allow access from zones. Note that hosts in the Trusted Zone will always be allowed full access")."</div>";
+		if (\FreePBX::Firewall()->getConfig('responsivefw') && \FreePBX::Firewall()->getConfig("iax", "rfw")) {
+			$retarr['descr'] .= "<div class='well'>"._("This protocol is being managed by the Responsive Firewall. You <strong>should not</strong> enable access from the 'Internet' zone, or Responsive Firewall will be bypassed.")."</div>";
 		}
 		return $retarr;
 	}
@@ -334,7 +336,7 @@ class Services {
 		$retarr = array(
 			"name" => _("HTTP Provisioning"),
 			"defzones" => array("other", "internal"),
-			"descr" => _("Phones that are configured via Endpoint Manager will use this port to download its configuration. It is NOT ADVISED to expose this port to the public internet, as SIP Secrets will be available to a knowledgable attacker."),
+			"descr" => _("Phones that are configured via Endpoint Manager to use HTTP provisioning will use this port to download its configuration. It is NOT ADVISED to expose this port to the public internet, as SIP Secrets will be available to a knowledgable attacker."),
 			"fw" => array(array("protocol" => "tcp", "port" => 84)),
 		);
 		// TODO: This is not portable for machines that don't have sysadmin.
@@ -342,15 +344,38 @@ class Services {
 		try {
 			$ports = \FreePBX::Sysadmin()->getPorts();
 			$retarr['fw'] = array();
-			if (isset($ports['hpro']) && $ports['hpro'] !== 'disabled' && $ports['hpro'] > 80) {
+			if (isset($ports['hpro']) && $ports['hpro'] !== 'disabled' && $ports['hpro'] >= 80) {
 				$retarr['fw'][] = array("protocol" => "tcp", "port" => $ports['hpro']);
-			}
-			if (isset($ports['sslhpro']) && $ports['sslhpro'] !== 'disabled' && $ports['sslhpro'] > 80) {
-				$retarr['fw'][] = array("protocol" => "tcp", "port" => $ports['sslhpro']);
 			}
 			if (!$retarr['fw']) {
 				// No port are assigned to restapps, it's not enabled in sysadmin
 				$retarr['descr'] = _("HTTP Provisioning is disabled in Sysadmin Port Management");
+				$retarr['disabled'] = true;
+			}
+		} catch (\Exception $e) {
+			// ignore
+		}
+		return $retarr;
+	}
+
+	private function getSvc_provis_ssl() {
+		$retarr = array(
+			"name" => _("HTTPS Provisioning"),
+			"defzones" => array("other", "internal"),
+			"descr" => _("Phones that are configured via Endpoint Manager to use HTTPS provisioning will use this port to download its configuration. It is NOT ADVISED to expose this port to the public internet, as SIP Secrets will be available to a knowledgable attacker."),
+			"fw" => array(array("protocol" => "tcp", "port" => 1443)),
+		);
+		// TODO: This is not portable for machines that don't have sysadmin.
+		// Ask sysadmin for the REAL port of the admin interface
+		try {
+			$ports = \FreePBX::Sysadmin()->getPorts();
+			$retarr['fw'] = array();
+			if (isset($ports['sslhpro']) && $ports['sslhpro'] !== 'disabled' && $ports['sslhpro'] >= 80) {
+				$retarr['fw'][] = array("protocol" => "tcp", "port" => $ports['sslhpro']);
+			}
+			if (!$retarr['fw']) {
+				// No port are assigned to restapps, it's not enabled in sysadmin
+				$retarr['descr'] = _("HTTPS Provisioning is disabled in Sysadmin Port Management");
 				$retarr['disabled'] = true;
 			}
 		} catch (\Exception $e) {
@@ -373,7 +398,7 @@ class Services {
 
 	private function getSvc_restapps() {
 		$retarr = array(
-			"name" => _("REST Apps"),
+			"name" => _("REST Apps (HTTP)"),
 			"defzones" => array("internal"),
 			"descr" => _("REST Apps are used with intelligent phones to provide an interactive interface from the phone itself. Note that any devices that are allowed access via Responsive Firewall are automatically granted access to this service."),
 			"fw" => array(),
@@ -382,17 +407,42 @@ class Services {
 		// Ask sysadmin for the REAL port of the admin interface
 		try {
 			$ports = \FreePBX::Sysadmin()->getPorts();
-			if (isset($ports['restapps']) && $ports['restapps'] !== 'disabled' &&  $ports['restapps'] > 80) {
+			if (isset($ports['restapps']) && $ports['restapps'] !== 'disabled' &&  $ports['restapps'] >= 80) {
 				$retarr['fw'][] = array("protocol" => "tcp", "port" => $ports['restapps']);
 			}
-			if (isset($ports['sslrestapps']) && $ports['sslrestapps'] !== 'disabled' && $ports['sslrestapps'] > 80) {
+
+			// Were there any ports discovered?
+			if (!$retarr['fw']) {
+				// No port are assigned to restapps, it's not enabled in sysadmin
+				$retarr['descr'] = _("HTTP REST Apps are disabled in Sysadmin Port Management");
+				$retarr['disabled'] = true;
+			}
+		} catch (\Exception $e) {
+			$retarr['descr'] = _("REST Apps are only available with System Admin");
+			$retarr['disabled'] = true;
+		}
+		return $retarr;
+	}
+
+	private function getSvc_restapps_ssl() {
+		$retarr = array(
+			"name" => _("REST Apps (HTTPS)"),
+			"defzones" => array("internal"),
+			"descr" => _("REST Apps are used with intelligent phones to provide an interactive interface from the phone itself. Note that any devices that are allowed access via Responsive Firewall are automatically granted access to this service."),
+			"fw" => array(),
+		);
+		// TODO: This is not portable for machines that don't have sysadmin.
+		// Ask sysadmin for the REAL port of the admin interface
+		try {
+			$ports = \FreePBX::Sysadmin()->getPorts();
+			if (isset($ports['sslrestapps']) && $ports['sslrestapps'] !== 'disabled' && $ports['sslrestapps'] >= 80) {
 				$retarr['fw'][] = array("protocol" => "tcp", "port" => $ports['sslrestapps']);
 			}
 
 			// Were there any ports discovered?
 			if (!$retarr['fw']) {
 				// No port are assigned to restapps, it's not enabled in sysadmin
-				$retarr['descr'] = _("REST Apps are disabled in Sysadmin Port Management");
+				$retarr['descr'] = _("HTTPS REST Apps are disabled in Sysadmin Port Management");
 				$retarr['disabled'] = true;
 			}
 		} catch (\Exception $e) {

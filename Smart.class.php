@@ -176,14 +176,9 @@ class Smart {
 			}
 			foreach ($pjbinds as $allports) {
 				foreach ($allports as $protocol => $port) {
-					// Throw if we weren't given a port (unless it's ws)
+					// Ignore protocol if we weren't given a port
 					if ((int) $port < 1024) {
-						// We don't care about websockets
-						if ($protocol == "ws" || $protocol == "wss") {
-							continue;
-						} else {
-							throw new \Exception("Protocol '$protocol' didn't tell me what port it was listening on");
-						}
+						continue;
 					}
 
 					// If it's not udp, it's tcp.
@@ -401,7 +396,11 @@ class Smart {
 
 			// Let's do some DNS-ing
 			// TODO: See how this goes. It might be better to use something like http://www.purplepixie.org/phpdns/
-			$dns = dns_get_record($host, \DNS_A|\DNS_AAAA);
+			try {
+				$dns = dns_get_record($host, \DNS_A|\DNS_AAAA);
+			} catch (\Exception $e) {
+				$dns = array();
+			}
 
 			// Sometimes we may have a transient DNS error. If dns_get_record returned nothing,
 			// but last time it returned something, we return the last one. This only happens
@@ -439,6 +438,7 @@ class Smart {
 		// Pass by ref to the rest to remove dupes
 		$this->getChansipContacts($astman, $contacts);
 		$this->getIaxContacts($astman, $contacts);
+		$this->getZuluContacts($contacts);
 		return array_keys($contacts);
 	}
 
@@ -521,6 +521,38 @@ class Smart {
 		}
 	}
 
+	private function getZuluContacts(&$contacts) {
+		// Get our list of 'client_ip's from Zulu, if zulu is enabled and running.
+		//
+		// Check if zulu is running by seeing if we can bind to the zulu port.
+		$tmparr = $this->db->query("SELECT `value`,`defaultval` FROM `freepbx_settings` WHERE `keyword`='ZULUBINDPORT'")->fetchAll(\PDO::FETCH_ASSOC);
+		if (!isset($tmparr[0])) {
+			// Database error?
+			return;
+		}
+		if (empty($tmparr[0]['value'])) {
+			$zuluport = $tmparr[0]['defaultval'];
+		} else {
+			$zuluport = $tmparr[0]['value'];
+		}
 
+		$socket = @socket_create_listen($zuluport);
+		if ($socket) {
+			// Zulu is not running, ignore anything in the zulu database
+			return;
+		}
+
+		// Now we are sure that zulu is running, we can trust(ish) data in the zulu table.
+		try {
+			// This is only present in Zulu 3.
+			$tmparr = $this->db->query("SELECT DISTINCT(client_ip) from zulu_tokens")->fetchAll(\PDO::FETCH_COLUMN);
+		} catch (\Exception $e) {
+			// If zulu 3 isn't installed, return an empty array
+			$tmparr = array();
+		}
+		foreach ($tmparr as $ip) {
+			$contacts[$ip] = true;
+		}
+	}
 
 }
