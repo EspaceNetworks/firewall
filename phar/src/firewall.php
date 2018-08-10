@@ -3,16 +3,23 @@
 $debug = true;
 
 $thissvc = "firewall";
-include 'lock.php';
+// Include once because *sometimes*, on *some machines*, it crashes?
+include_once 'lock.php';
 use \FreePBX\modules\Firewall\Lock;
 
 if (!Lock::canLock($thissvc)) {
-	print "Firewall Service already running, not restarting...\n";
-	syslog(LOG_WARNING|LOG_LOCAL0, "Firewall Service already running, not restarting...");
+	// No need to output this
+	// print "Firewall Service already running, not restarting...\n";
 	exit;
 }
 
-require 'common.php';
+// Regen fail2ban conf, if we can
+if (file_exists("/var/www/html/admin/modules/sysadmin/hooks/fail2ban-generate")) {
+	`/var/www/html/admin/modules/sysadmin/hooks/fail2ban-generate`;
+	`/var/www/html/admin/modules/sysadmin/hooks/fail2ban-start`;
+}
+
+include_once 'common.php';
 
 // Load our validator
 $v = new \FreePBX\modules\Firewall\Validator($sig);
@@ -21,18 +28,7 @@ if (posix_geteuid() !== 0) {
 	throw new \Exception("I must be run as root.");
 }
 
-// Grab what our database connection settings are
-$f = file_get_contents("/etc/freepbx.conf");
-
-preg_match_all("/amp_conf\[['\"](.+)['\"]\]\s?=\s?['\"](.+)['\"];/m", $f, $out);
-$mysettings = array();
-
-foreach($out[1] as $id => $val) {
-	$mysettings[$val] = $out[2][$id];
-}
-
-$fwconf = getSettings($mysettings);
-
+$fwconf = getSettings();
 if (!$fwconf['active']) {
 	// Don't need to log this
 	// print "Not active. Shutting down\n";
@@ -40,10 +36,6 @@ if (!$fwconf['active']) {
 } else {
 	print "Starting firewall.\n";
 }
-
-// Always load nf_contract_ftp, even if FTP isn't allowed,
-// as it helps with OUTBOUND connections, too.
-`modprobe nf_conntrack_ftp &> /dev/null`;
 
 // How to detect if we're going into safe mode:
 //   1.  $services['safemode']['status'] == bool true
@@ -64,7 +56,7 @@ while (!$ready) {
 		continue;
 	}
 
-	if (!$services['safemode']['status']) {
+	if ($services['safemode']['status'] !== "enabled") {
 		// Safemode isn't enabled;
 		break;
 	}
@@ -116,6 +108,10 @@ while (!$ready) {
 }
 wall("Firewall service now starting.\n\n");
 
+// Fork off the monitor process
+include_once 'monitor.php';
+$monitorpid = start_monitor();
+
 // Delete our safemode flag if it exists.
 @unlink("/var/run/firewalld.safemode");
 
@@ -126,23 +122,31 @@ $f = $v->checkFile("bin/clean-iptables");
 // Start fail2ban if we can
 `service fail2ban start`;
 
+// Always load ip_contrack_ftp, even if FTP isn't allowed,
+// as it helps with OUTBOUND connections, too.
+`/sbin/modprobe ip_conntrack_ftp`;
+`/sbin/modprobe nf_conntrack_ftp`;
+// Same for TFTP
+`/sbin/modprobe ip_conntrack_tftp`;
+`/sbin/modprobe nf_conntrack_tftp`;
+
 // Make sure our conntrack kernel module is configured correctly
-include 'modprobe.php';
+include_once 'modprobe.php';
 $m = new \FreePBX\Firewall\Modprobe;
 $m->checkModules();
 unset($m);
 
 $path = $v->checkFile("Services.class.php");
-include $path;
+include_once $path;
 $services = new \FreePBX\modules\Firewall\Services;
 
 $path = $v->checkFile("Attacks.class.php");
-include $path;
+include_once $path;
 
 // Now, start by grabbing our interfaces, and making sure
 // they are configured correctly.
 $path = $v->checkFile("Network.class.php");
-include $path;
+include_once $path;
 $netobj = new \FreePBX\modules\Firewall\Network;
 
 $known = $netobj->discoverInterfaces();
@@ -152,7 +156,6 @@ foreach ($known as $int => $conf) {
 		continue;
 	}
 	if (!isset($conf['config']['ZONE']) || !isValidZone($conf['config']['ZONE'])) {
-		$netobj->updateInterfaceZone($int, "trusted");
 		$zone = "trusted";
 	} else {
 		$zone = $conf['config']['ZONE'];
@@ -163,6 +166,7 @@ foreach ($known as $int => $conf) {
 
 // Same for our known networks
 $nets = array();
+$fwconf = getSettings();
 if (!empty($fwconf['networkmaps'])) {
 	$nets = @json_decode($fwconf['networkmaps'], true);
 }
@@ -187,11 +191,33 @@ $fwversion = false;
 $lastfin = 1;
 
 while(true) {
-	$fwconf = getSettings($mysettings);
+	$fwconf = getSettings();
 	if (!$fwconf['active']) {
+		// If we're here, we WERE running, and now we're not.
+		// Is this because of some database strangeness?  If we have an
+		// empty array, ignore it, and sleep for 30 seconds.
+		if (!$fwconf) {
+			wall("Firewall getSettings returned empty array. Database connection error!\nSleeping for 60 seconds before retrying\n");
+			sleep(60);
+			continue;
+		}
+		// Make sure we're REALLY meant to be shutting down.
+		if (file_exists("/etc/asterisk/firewall.lock") || file_exists("/etc/asterisk/firewall.enabled")) {
+			wall("/etc/aterisk/firewall.lock or /etc/asterisk/firewall.enabled exists!\nRefusing to shut down.\n");
+			sleep(10);
+			checkPhar();
+			continue;
+		}
+
+		// Nope, it was shut down deliberately.
 		fwLog("Not active. Shutting down");
+		wall("Firewall has been disabled. Shutting down.");
 		shutdown();
 	}
+	
+	// If monitor has stopped for some reason, restart it.
+	$monitorpid = checkMonitor($monitorpid);
+
 	checkPhar();
 	$runafter = $lastfin + $fwconf['period'];
 	if ($runafter < time()) {
@@ -202,27 +228,59 @@ while(true) {
 	} else {
 		// Sleep until we're ready to go again.
 		sigSleep($fwconf['period']/10);
+
 	}
 }
 
-function getSettings($mysettings) {
+function checkMonitor($monitorpid) {
+	// If our monitor process is missing, we need to restart it.
+
+	// This makes sure we reap any child processes before checking if they exist!
+	pcntl_waitpid($monitorpid, $status, WNOHANG);
+
+	if (!is_dir("/proc/$monitorpid")) {
+		fwLog("Monitor process $monitorpid missing - restarting!");
+		return start_monitor();
+	}
+	return $monitorpid;
+}
+
+function getSettings() {
+	// Grab what our database connection settings are
+	$f = file_get_contents("/etc/freepbx.conf");
+
+	preg_match_all("/amp_conf\[['\"](.+)['\"]\]\s?=\s?['\"](.+)['\"];/m", $f, $out);
+	$mysettings = array();
+
+	foreach($out[1] as $id => $val) {
+		$mysettings[$val] = $out[2][$id];
+	}
+
+	// If the Datbase goes away, this will wait indefinately for a connection.
 	$pdo = getDbHandle($mysettings);
+
 	//
 	// TRANSIENT FIX
 	//
 	// As kvstore has been split into multiple tables in FreePBX 14, we need
-	// to work with both.  For the moment, try to use `kvstore`, and if that
-	// fails, try again with the F14 name.
+	// to work with both.  For the moment, try to use the new kvstore table,
+	// called 'kvstore_FreePBX_modules_Firewall', and if that fails, fall back
+	// to the original 13 name.
 	// 
 	// This should be removed in FreePBX 15, and only the new name should be tried.
 	try {
-		$sth = $pdo->prepare('SELECT * FROM `kvstore` where `module`=? and id="noid"');
-		$sth->execute(array('FreePBX\modules\Firewall'));
-		$res = $sth->fetchAll();
-	} catch (\Exception $e) {
 		$sth = $pdo->prepare('SELECT * FROM `kvstore_FreePBX_modules_Firewall` where id="noid"');
 		$sth->execute();
 		$res = $sth->fetchAll();
+	} catch (\Exception $e) {
+		try {
+			$sth = $pdo->prepare('SELECT * FROM `kvstore` where `module`=? and id="noid"');
+			$sth->execute(array('FreePBX\modules\Firewall'));
+			$res = $sth->fetchAll();
+		} catch (\Exception $e) {
+			// Neither new or old table names exist, so there's nothing configured.
+			$res = array();
+		}
 	}
 
 	$retarr = array();
@@ -280,7 +338,17 @@ function shutdown() {
 }
 
 function getDbHandle($mysettings) {
+	global $thissvc;
 	static $pdo = false;
+	static $lastsettings = false;
+
+	// If the current settings are different to the last settings,
+	// recreate the PDO object.
+	if (json_encode($mysettings, true) !== $lastsettings) {
+		$lastsettings = json_encode($mysettings, true);
+		$pdo = false;
+	}
+
 	// Make sure it hasn't gone away if it previously existed
 	if (is_object($pdo)) {
 		try {
@@ -292,7 +360,7 @@ function getDbHandle($mysettings) {
 	}
 
 	// Now, do we need to connect or reconnect?
-	if (!$pdo) {
+	while (!$pdo) {
 		if(empty($mysettings['AMPDBSOCK'])) {
 			if (empty($mysettings['AMPDBHOST'])) {
 				$conn = "host=localhost";
@@ -303,8 +371,10 @@ function getDbHandle($mysettings) {
 			$conn = "unix_socket=".$mysettings['AMPDBSOCK'];
 		}
 		$dsn = $mysettings['AMPDBENGINE'].":$conn;dbname=".$mysettings['AMPDBNAME'].";charset=utf8";
+
 		// Try up to 15 times to connect, waiting 2 seconds between tries. This gives us 30
-		// seconds to actually make sure everything it started.
+		// seconds to actually make sure everything is started.
+		// If it hasn't connected after 30 seconds, wall and keep trying.
 		$count = 0;
 		while ($count < 16) {
 			try {
@@ -321,7 +391,8 @@ function getDbHandle($mysettings) {
 			break;
 		}
 		if (!$pdo) {
-			throw new \Exception("Can't connect to database after 30 seconds, giving up");
+			// Something bad is happening. Wall about mysql not being there, and then keep trying.
+			wall("Firewall was unable to connect to MySQL after 30 seconds.\nCheck Database!\n");
 		}
 	}
 	return $pdo;
@@ -577,69 +648,82 @@ function updateFirewallRules($firstrun = false) {
 	}
 
 	// Set the firewall to drop or reject mode.
-	if ($getservices['dropinvalid']) {
-		$driver->setRejectMode(true, false);
-	} else {
+	if ($getservices['advancedsettings']['rejectpackets'] === "enabled") {
 		$driver->setRejectMode(false, false);
+	} else {
+		$driver->setRejectMode(true, false);
 	}
 
 	// Update any interfaces that may have changed
 	$known = $netobj->discoverInterfaces();
-	if (is_array($currentrules['ipv4']['filter']['fpbxinterfaces'])) {
+	if (!isset($currentrules['ipv4']['filter']['fpbxinterfaces']) || !is_array($currentrules['ipv4']['filter']['fpbxinterfaces'])) {
+		$fints = array();
+	} else {
 		$fints = $currentrules['ipv4']['filter']['fpbxinterfaces'];
+	}
 
-		// Look through our current rules and make sure they aren't referencing
-		// interfaces that don't exist, or, are wrong.
+	// Look through our current rules and make sure they aren't referencing
+	// interfaces that don't exist, or, are wrong.
 
-		// Cache the discovered interfaces for later.
-		$currentcache = array();
+	// Cache the discovered interfaces for later.
+	$currentcache = array();
 
-		foreach ($fints as $entry) {
-			if (!preg_match("/-i ([^\s]+) -j zone-(.+)$/", $entry, $out)) {
-				// something bad here
-				print "ERROR: Unable to parse interface line '$entry', skipping. THIS IS A BUG\n";
-				continue;
-			}
-			// Debugging:
-			// print "Line $entry - int ".$out[1]." to zone ".$out[2]."\n";
+	foreach ($fints as $entry) {
+		if (!preg_match("/-i ([^\s]+) -j zone-(.+)$/", $entry, $out)) {
+			// something bad here
+			print "ERROR: Unable to parse interface line '$entry', skipping. THIS IS A BUG\n";
+			continue;
+		}
+		// Debugging:
+		// print "Line $entry - int ".$out[1]." to zone ".$out[2]."\n";
 
-			// Does this rule point to a valid interface?
-			if (!isset($known[$out[1]])) {
-				// We have a rule that references a non-existant interface, so it should be
-				// removed.
-				$driver->changeInterfaceZone($out[1], false);
-				continue;
-			}
-
-			// Is iptables pointing to the correct zone?
-			if ($out[2] !== $known[$out[1]]['config']['ZONE']) {
-				// No. Fix it.
-				$driver->changeInterfaceZone($out[1], $out[2]);
-			}
-			// Mark it as discovered
-			$currentcache[$out[1]] = $out[2];
+		// Does this rule point to a valid interface?
+		if (!isset($known[$out[1]])) {
+			// We have a rule that references a non-existant interface, so it should be
+			// removed.
+			$driver->changeInterfaceZone($out[1], false);
+			continue;
 		}
 
-		// Now go through our discovered interfaces, and see if any
-		// are missing
-		foreach ($known as $intname => $tmparr) {
-			// If this is a child of another interface, ignore
-			if ($tmparr['config']['PARENT']) {
-				continue;
-			}
-			// Has this zone been previously discovered?
-			if (!isset($tmparr['config']['ZONE'])) {
-				// No? Set it to trusted.
-				$driver->changeInterfaceZone($intname, 'trusted');
-				continue;
-			}
+		// If the current known interface DOESN'T have a zone, we
+		// assume it's 'trusted'.
+		if (empty($known[$out[1]]['config']['ZONE'])) {
+			 $known[$out[1]]['config']['ZONE'] = "trusted";
+		}
 
+		// Is iptables pointing to the correct zone?
+		if ($out[2] !== $known[$out[1]]['config']['ZONE']) {
+			// No. Fix it.
+			$driver->changeInterfaceZone($out[1], $known[$out[1]]['config']['ZONE']);
+		}
+
+		$currentcache[$out[1]] = $known[$out[1]]['config']['ZONE'];
+	}
+
+	// Now go through our discovered interfaces, and see if any
+	// are missing
+	foreach ($known as $intname => $tmparr) {
+		// If this is a child of another interface, ignore
+		if ($tmparr['config']['PARENT']) {
+			continue;
+		}
+
+		// If it's not configured, default to trusted
+		if (!isset($tmparr['config']['ZONE'])) {
+			$zoneshouldbe = "trusted";
+		} else { 
 			$zoneshouldbe = $tmparr['config']['ZONE'];
-			// Is this interface pointing at the right zone?
-			if (!isset($currentcache[$intname]) || $zoneshouldbe !== $currentcache[$intname]) {
-				$driver->changeInterfaceZone($intname, $zoneshouldbe);
-			}
 		}
+
+		// Is this interface pointing at the right zone?
+		if (!isset($currentcache[$intname]) || $zoneshouldbe !== $currentcache[$intname]) {
+			$driver->changeInterfaceZone($intname, $zoneshouldbe);
+		}
+	}
+
+	// If this is the first run, import the custom firewall rules, if enabled
+	if ($firstrun && $getservices['advancedsettings']['customrules'] === "enabled") {
+		importCustomRules();
 	}
 }
 
@@ -686,7 +770,7 @@ function getServices() {
 		chmod("/var/www/html/admin/modules/firewall/bin/getservices", 0755);
 	}
 
-	exec("su -c /var/www/html/admin/modules/firewall/bin/getservices $astuser", $out, $ret);
+	exec("/sbin/runuser $astuser -c /var/www/html/admin/modules/firewall/bin/getservices", $out, $ret);
 	$getservices = @json_decode($out[0], true);
 	if (!is_array($getservices) || !isset($getservices['smartports'])) {
 		fwLog("Unparseable output from getservices - ".json_encode($out)." - returned $ret");
@@ -694,3 +778,34 @@ function getServices() {
 	}
 	return $getservices;
 }
+
+function importCustomRules() {
+	$files = array("/sbin/iptables" => "/etc/firewall-4.rules", "/sbin/ip6tables" => "/etc/firewall-6.rules");
+	foreach ($files as $ipt => $f) {
+		// Validate file
+		if (!file_exists($f)) {
+			fwLog("Custom Firewall rules file $f does not exist, skipping");
+			continue;
+		}
+		$stat = stat($f);
+		if ($stat['uid'] !== 0) {
+			fwLog("Custom Firewall rules file $f not owned by root, skipping");
+			continue;
+		}
+		// Todo: Writable checks
+		$cmds = file($f, FILE_IGNORE_NEW_LINES|FILE_SKIP_EMPTY_LINES);
+		foreach ($cmds as $id => $cmd) {
+			if (empty($cmd) || strpos($cmd, "#") === 0 || strpos($cmd, ";") === 0) {
+				$lineno = $id + 1;
+				fwLog("Skipping line $lineno in file $f ('$cmd')");
+				continue;
+			}
+			$safecmd = escapeshellcmd($cmd);
+			fwLog("Custom rule: $ipt $safecmd");
+			exec("$ipt $safecmd");
+		}
+	}
+}
+
+
+

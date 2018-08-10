@@ -1,6 +1,6 @@
-$(document).ready(function() { 
+$(document).ready(function() {
 	// Update address bar when someone changes tabs
-	$("a[data-toggle='tab']").on('shown.bs.tab', function(e) { 
+	$("a[data-toggle='tab']").on('shown.bs.tab', function(e) {
 		// New target. Don't need jquery here...
 		var newuri = updateQuery("tab", e.target.getAttribute('aria-controls'));
 		window.history.replaceState(null, document.title, newuri);
@@ -12,7 +12,7 @@ $(document).ready(function() {
 		$.ajax({
 			url: window.FreePBX.ajaxurl,
 			data: { command: 'delattacker', module: 'firewall', target: t },
-			success: function(data) { 
+			success: function(data) {
 				triggerPageUpdate();
 			},
 		});
@@ -48,7 +48,7 @@ function updateQuery(key, value) {
 			var separator = url.indexOf('?') !== -1 ? '&' : '?';
 			hash = url.split('#');
 			url = hash[0] + separator + key + '=' + value;
-			if (typeof hash[1] !== 'undefined' && hash[1] !== null) 
+			if (typeof hash[1] !== 'undefined' && hash[1] !== null)
 				url += '#' + hash[1];
 			return url;
 		} else {
@@ -63,10 +63,10 @@ function updateStatusPage() {
 	$.ajax({
 		url: window.FreePBX.ajaxurl,
 		data: { command: 'getattackers', module: 'firewall' },
-		success: function(data) { 
+		success: function(data) {
 			$(".notloading").text("").show();
 			$(".loading").hide();
-			processStatusUpdate(data); 
+			processStatusUpdate(data);
 		},
 	});
 }
@@ -126,10 +126,12 @@ function genBlockedHtml(attackers, d) {
 	$("#noattackers").hide();
 	var h = "";
 	$.each(attackers, function (i, v) {
-		h += "<div class='element-container'><div class='row'><div class='col-sm-3'><h4>"+v+"</h4></div>";
-		h += "<div class='col-sm-7'>Last 5 packets:<ul>"+formatTimestamps(v, d)+"</ul></div>";
+		h += "<div class='element-container'><div class='row'>";
+		h += "<div class='col-sm-3'><h4>"+v+"</h4></div>";
+		h += "<div class='col-sm-8'>"+_("Last 5 packets")+":<ul>"+formatTimestamps(v, d)+"</ul></div>";
 		h += "<div class='col-sm-1'>";
 		h += "<button type='button' class='btn x-btn btn-danger delbutton' data-ip='"+v+"' title='Unblock'><span data-ip='"+v+"' class='glyphicon glyphicon-remove'></span></button>"
+		h += "</div>";
 		h += "</div></div>";
 	});
 	$("#attackersdiv").html(h);
@@ -158,7 +160,7 @@ function strDate(d) {
 	var dd = pad(d.getDate());
 	var MM = pad(d.getMonth()+1); // Month is from 0-11, not 1-12.
 	var yyyy = d.getFullYear();
-	
+
 	var ret = yyyy+"-"+MM+"-"+dd+" "+hh+":"+mm+":"+ss;
 	return ret;
 }

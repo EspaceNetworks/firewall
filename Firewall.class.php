@@ -8,19 +8,31 @@ class Firewall extends \FreePBX_Helpers implements \BMO {
 
 	private static $services = false;
 
-	public function install() {}
+	public function install() {
+		// Upgrade at 13.0.47 - If the firewall is enabled, create the filesystem
+		// flag to say that it is.
+		if ($this->getConfig("status")) {
+			if (!file_exists("/etc/asterisk/firewall.enabled")) {
+				touch("/etc/asterisk/firewall.enabled");
+			}
+		}
+		// 13.0.54 - Add cronjob to restart it if it crashes
+		$this->addCronJob();
+	}
 
 	public function uninstall() {
 		// Disable the firewall when it's uninstalled,
 		// so if it is automatically reinstalled at some
 		// point, it doesn't start.
-		$this->setConfig("status", true);
+		$this->setConfig("status", false);
+		@unlink("/etc/asterisk/firewall.enabled");
 		$o = \FreePBX::OOBE()->getConfig("completed");
 		if (is_array($o)) {
 			unset ($o['firewall']);
 			\FreePBX::OOBE()->setConfig("completed", $o);
 			$this->setConfig("oobeanswered", array());
 		}
+		$this->removeCronJob();
 	}
 
 	public function backup() {}
@@ -127,7 +139,7 @@ class Firewall extends \FreePBX_Helpers implements \BMO {
 			$trusted['order'] = 1;
 			$this->Notifications()->add_critical('firewall', 'newint', _("New Interface Detected"),
 				sprintf(_("A new, unconfigured, network interface has been detected. Please assign interface '%s' to a zone."), $foundnewint),
-				"?display=firewall&page=zones&tab=intsettings",
+				"?display=firewall&page=about&tab=interfaces",
 				true, // Reset on update.
 				false); // Can delete
 			return array($status, $trusted);
@@ -137,10 +149,14 @@ class Firewall extends \FreePBX_Helpers implements \BMO {
 			// Add core notification
 			$this->Notifications()->add_critical('firewall', 'trustedint', _("Trusted Interface Detected"),
 				sprintf(_("A network interface that is assigned to the 'Trusted' zone has been detected. This is a misconfiguration. To ensure your system is protected from attacks, please change the default zone of interface '%s'."), $foundtrustedint),
-				"?display=firewall&page=zones&tab=intsettings",
+				"?display=firewall&page=about&tab=interfaces",
 				true, // Reset on update.
 				false); // Can delete
 			return array($status, $trusted);
+		} else {
+			// No errors with interfaces, so delete any old notifications
+			$this->Notifications()->delete('firewall', 'newint');
+			$this->Notifications()->delete('firewall', 'trustedint');
 		}
 
 		// Now we need to validate that we DO have a trusted network or host. 
@@ -162,11 +178,11 @@ class Firewall extends \FreePBX_Helpers implements \BMO {
 			// Yup, there's at least one!
 			$trusted = array_merge($trusted, $this->Dashboard()->genStatusIcon('ok', _("Trusted Management Network defined")));
 		} else {
-			$trusted = array_merge($trusted, $this->Dashboard()->genStatusIcon('warn', _("No Trusted Management Network")));
+			$trusted = array_merge($trusted, $this->Dashboard()->genStatusIcon('warning', _("No Trusted Management Network")));
 			// Add core notification
 			$this->Notifications()->add_warning('firewall', 'trustednet', _("No Trusted Network or Host defined"),
 				_("No Trusted Network or Host has been defined. Every server should have a 'Trusted' host or network to ensure that in case of configuration error, the machine is still accessible."),
-				"?display=firewall&page=zones&tab=netsettings",
+				"?display=firewall&page=about&tab=networks",
 				true, // Reset on update.
 				true); // Can delete
 		}
@@ -194,19 +210,47 @@ class Firewall extends \FreePBX_Helpers implements \BMO {
 		// So this is the hook I want to run
 		$filename = "$basedir/firewall.$hookname";
 
+		// If we have a modern sysadmin_rpm, we can put the params
+		// INSIDE the hook file, rather than as part of the filename
+		if (file_exists("/etc/sysadmin_contents_max")) {
+			$fh = fopen("/etc/sysadmin_contents_max", "r");
+			if ($fh) {
+				$max = (int) fgets($fh);
+				fclose($fh);
+			}
+		} else {
+			$max = false;
+		}
+
+		if ($max > 65535 || $max < 128) {
+			$max = false;
+		}
+
 		// Do I have any params?
+		$contents = "";
 		if ($params) {
 			// Oh. I do. If it's an array, json encode and base64
 			if (is_array($params)) {
 				$b = base64_encode(gzcompress(json_encode($params)));
-				// Note we derp the base64, changing / to _, because filepath.
-				$filename .= ".".str_replace('/', '_', $b);
+				// Note we derp the base64, changing / to _, because this may be used as a filepath.
+				if ($max) {
+					if (strlen($b) > $max) {
+						throw new \Exception("Contents too big for current sysadmin-rpm. This is possibly a bug!");
+					}
+					$contents = $b;
+					$filename .= ".CONTENTS";
+				} else {
+					$filename .= ".".str_replace('/', '_', $b);
+					if (strlen($filename) > 200) {
+						throw new \Exception("Too much data, and old sysadmin rpm. Please run 'yum update'");
+					}
+				}
 			} elseif (is_object($params)) {
 				throw new \Exception("Can't pass objects to hooks");
 			} else {
 				// Cast it to a string if it's anything else, and then make sure
 				// it doesn't have any spaces.
-				$filename .= ".".preg_replace("/[[:blank:]]+/", (string) $params);
+				$filename .= ".".preg_replace("/[[:blank:]]+/", "", (string) $params);
 			}
 		}
 
@@ -215,6 +259,9 @@ class Firewall extends \FreePBX_Helpers implements \BMO {
 			// WTF, unable to create file?
 			throw new \Exception("Unable to create hook trigger '$filename'");
 		}
+
+		// Put our contents there, if there are any.
+		fwrite($fh, $contents);
 
 		// As soon as we close it, incron does its thing.
 		fclose($fh);
@@ -258,7 +305,7 @@ class Firewall extends \FreePBX_Helpers implements \BMO {
 			$thishost = $this->detectHost();
 			print "<div class='alert alert-warning' id='lockoutwarning'>";
 			print "<p>".sprintf(_("The client machine you are using to manage this server (<tt>%s</tt>) is <strong>not</strong> a member of the Trusted zone. It is highly recommended to add this client to your Trusted Zone to avoid accidental lockouts."), $thishost)."</p>";
-			print "<p><a href='?display=firewall&page=about&tab=shortcuts'>"._("You can add the host automatically here.")."</a></p>";
+			print "<p><a href='?display=firewall&page=advanced&tab=shortcuts'>"._("You can add the host automatically here.")."</a></p>";
 			print "</div>";
 		}
 	}
@@ -276,6 +323,13 @@ class Firewall extends \FreePBX_Helpers implements \BMO {
 		if (strpos($page, ".") !== false) {
 			throw new \Exception("Invalid page name $page");
 		}
+
+		// Check to see if it's 'zones', which means it's an old notification.
+		if ($page == "zones") {
+			$page = "about";
+			$_REQUEST['tab'] = "interfaces";
+		}
+
 		$view = __DIR__."/views/page.$page.php";
 		if (!file_exists($view)) {
 			throw new \Exception("Can't find page $page");
@@ -291,11 +345,19 @@ class Firewall extends \FreePBX_Helpers implements \BMO {
 
 	public function ajaxHandler() {
 		switch ($_REQUEST['command']) {
-		case "removenetwork":
-			if (!isset($_REQUEST['net'])) {
-				throw new \Exception("No net");
+		case "deletenetworks":
+			// We are handed a JSON string
+			if (!isset($_REQUEST['json'])) {
+				throw new \Exception("No json?");
 			}
-			return $this->removeNetwork($_REQUEST['net']);
+			$nets = @json_decode($_REQUEST['json'], true);
+			if (!is_array($nets)) {
+				throw new \Exception("Invalid JSON");
+			}
+			foreach ($nets as $net) {
+				$this->removeNetwork($net);
+			}
+			return true;
 		case "addnetworktozone":
 			if (!isset($_REQUEST['net'])) {
 				throw new \Exception("No net");
@@ -307,15 +369,25 @@ class Firewall extends \FreePBX_Helpers implements \BMO {
 			if (!isset($zones[$_REQUEST['zone']])) {
 				throw new \Exception("Invalid zone $zone");
 			}
-			return $this->addNetworkToZone(trim($_REQUEST['net']), $_REQUEST['zone']);
-		case "updatenetwork":
-			if (!isset($_REQUEST['net'])) {
-				throw new \Exception("No net");
+			if (!isset($_REQUEST['description'])) {
+				$descr = "";
+			} else {
+				$descr = trim($_REQUEST['description']);
 			}
-			if (!isset($_REQUEST['zone'])) {
-				throw new \Exception("No Zone");
+			return $this->addNetworkToZone(trim($_REQUEST['net']), $_REQUEST['zone'], $descr);
+		case "updatenetworks":
+			// We are handed a JSON string
+			if (!isset($_REQUEST['json'])) {
+				throw new \Exception("No json?");
 			}
-			return $this->changeNetworksZone(trim($_REQUEST['net']), $_REQUEST['zone']);
+			$nets = @json_decode($_REQUEST['json'], true);
+			if (!is_array($nets)) {
+				throw new \Exception("Invalid JSON");
+			}
+			foreach ($nets as $net => $tmparr) {
+				$this->changeNetworksZone($net, $tmparr['zone'], $tmparr['description']);
+			}
+			return true;
 		case "addrfc":
 			return $this->addRfcNetworks();
 		case "addthishost":
@@ -336,22 +408,21 @@ class Firewall extends \FreePBX_Helpers implements \BMO {
 			$nets[$thisnet] = "trusted";
 			$this->setConfig("networkmaps", $nets);
 			return $this->runHook('addnetwork', array('trusted' => array($thisnet)));
-		case "updateinterface":
-			// Remove any notifications about invalid interface configurations
-			$this->Notifications()->delete('firewall', 'trustedint');
+		case "updateinterfaces":
+			// Extract our interfaces
+			$ints = @json_decode($_REQUEST['ints'], true);
+			if (!is_array($ints)) {
+				throw new \Exception("Invalid interface data provided");
+			}
+			// Remove any previous notifications about interfaces (They'll be recreated
+			// if they need to be)
 			$this->Notifications()->delete('firewall', 'newint');
-			return $this->runHook('updateinterface', array('iface' => $_REQUEST['iface'], 'newzone' => $_REQUEST['zone']));
+			$this->Notifications()->delete('firewall', 'trustedint');
+			return $this->runHook("updateinterfaces", $_REQUEST);
 		case "updaterfw":
 			// Ensure people don't accidentally allow traffic through when rfw is enabled
 			$proto = $_REQUEST['proto'];
-
-			// Don't allow ANYTHING through when RFW is enabled
-			if ($_REQUEST['value'] == "true") {
-				$zones = array();
-			} else {
-				// If they're turning off rfw, allow internal
-				$zones = array("internal");
-			}
+			$zones = array("internal");
 
 			// Sanity check. 
 			switch ($proto) {
@@ -365,14 +436,6 @@ class Firewall extends \FreePBX_Helpers implements \BMO {
 			return $this->addToBlacklist(htmlentities(trim($_REQUEST['entry']), \ENT_QUOTES, 'UTF-8', false));
 		case "removefromblacklist":
 			return $this->removeFromBlacklist(htmlentities($_REQUEST['entry'], \ENT_QUOTES, 'UTF-8', false));
-		case "setsafemode":
-			if ($_REQUEST['value'] == "disabled") {
-				return $this->disableSafemode();
-			} elseif ($_REQUEST['value'] == "enabled") {
-				return $this->enableSafemode();
-			} else {
-				throw new \Exception("Unknown safemode");
-			}
 		case "setrejectmode":
 			if ($_REQUEST['value'] != "reject") {
 				return $this->setConfig("dropinvalid", true);
@@ -401,6 +464,10 @@ class Firewall extends \FreePBX_Helpers implements \BMO {
 			return $a->getAllAttacks($smart->getRegistrations());
 		case "delattacker":
 			return $this->runHook("removeallblocks", array("unblock" => $_REQUEST['target']));
+
+		// Advanced Settings
+		case "updateadvanced":
+			return $this->setAdvancedSetting($_REQUEST['option'], $_REQUEST['val']);
 
 		// OOBE
 		case "getoobequestion":
@@ -463,10 +530,12 @@ class Firewall extends \FreePBX_Helpers implements \BMO {
 			$nets[$thishost] = "trusted";
 			$this->setConfig("networkmaps", $nets);
 			$this->setConfig("status", true);
+			touch("/etc/asterisk/firewall.enabled");
 			$this->runHook("firewall");
 			return;
 		case 'disablefw':
 			if (!file_exists("/etc/asterisk/firewall.lock")) {
+				@unlink("/etc/asterisk/firewall.enabled");
 				$this->setConfig("status", false);
 				return;
 			} else {
@@ -488,14 +557,24 @@ class Firewall extends \FreePBX_Helpers implements \BMO {
 		}
 	}
 
-	// We want a button on the 'services' page
 	public function getActionBar($request) {
-		if (isset($request['page']) && $request['page'] == "services") {
-			return array(
-				"defaults" => array('name' => 'defaults', 'id' => 'btndefaults', 'value' => _("Defaults")),
-				"reset" => array('name' => 'reset', 'id' => 'btnreset', 'value' => _("Reset")),
-				"submit" => array('name' => 'submit', 'id' => 'btnsave', 'value' => _("Save")),
-			);
+		if ($this->getConfig("status")) {
+			// Buttons for the main page
+			// Note we have 'zones' here to capture any lingering FPBX Notifications which previously
+			// were on the Zones page. 
+			if (!isset($request['page']) || $request['page'] == "about" || $request['page'] == "zones") {
+				return array(
+					"savenets" => array('name' => 'savenets', 'style' => 'display: none', 'id' => 'savenets', 'value' => _("Save")),
+					"delsel" => array('name' => 'delsel', 'style' => 'display: none', 'id' => 'delsel', 'value' => _("Delete Selected")),
+					"saveints" => array('name' => 'saveints', 'style' => 'display: none', 'id' => 'saveints', 'value' => _("Update Interfaces")),
+				);
+			} elseif ($request['page'] === "services") {
+				return array(
+					// "defaults" => array('name' => 'defaults', 'id' => 'btndefaults', 'value' => _("Defaults")), // Unimplemented
+					"reset" => array('name' => 'reset', 'id' => 'btnreset', 'value' => _("Reset")),
+					"submit" => array('name' => 'submit', 'id' => 'btnsave', 'value' => _("Save")),
+				);
+			}
 		}
 	}
 
@@ -654,24 +733,7 @@ class Firewall extends \FreePBX_Helpers implements \BMO {
 	public function getZone($int) {
 		static $ints = false;
 		if (!$ints) {
-			$ints = array();
-			$zones = $this->getSystemZones();
-			foreach ($zones as $name => $zone) {
-				if (!$zone['interfaces']) {
-					continue;
-				}
-				foreach ($zone['interfaces'] as $i) {
-					$myInt = trim($i);
-					if ($myInt) {
-						$ints[$myInt] = $name;
-					}
-				}
-			}
-		}
-		// Is this an alias? eg eth0:123? Then return the zone for the REAL interface.
-		list ($realint) = explode(":", $int);
-		if (!isset($ints[$realint])) {
-			$ints[$realint] = 'trusted';
+			$ints = $this->getInterfaces();
 		}
 
 		// Is this a tunnel interface? That's always ALWAYS going to be
@@ -679,8 +741,15 @@ class Firewall extends \FreePBX_Helpers implements \BMO {
 		if (strpos($int, "tun") === 0) {
 			return "internal";
 		}
+		// Is this an alias? eg eth0:123? Then return the zone for the REAL interface.
+		list ($realint) = explode(":", $int);
 
-		return $ints[$realint];
+		// Make sure we HAVE a zone. Default to 'trusted'
+		if (!isset($ints[$realint]['config']['ZONE'])) {
+			$ints[$realint]['config']['ZONE'] = 'trusted';
+		}
+
+		return $ints[$realint]['config']['ZONE'];
 	}
 
 	public function getDriver() {
@@ -698,6 +767,15 @@ class Firewall extends \FreePBX_Helpers implements \BMO {
 		return $d->getZonesDetails();
 	}
 
+	public function getNetworkDescriptions() {
+		$desc = $this->getConfig("descriptions", "network");
+		if (!is_array($desc)) {
+			return array();
+		} else {
+			return $desc;
+		}
+	}
+	
 	public function detectNetwork() {
 		$client = $_SERVER['REMOTE_ADDR'];
 		// If this is an IPv4 address, treat it as a class C
@@ -756,10 +834,16 @@ class Firewall extends \FreePBX_Helpers implements \BMO {
 		$zone = $nets[$net];
 		unset($nets[$net]);
 		$this->setConfig("networkmaps", $nets);
+
+		$desc = $this->getConfig("descriptions", "network");
+		if (is_array($desc) && isset($desc[$net])) {
+			unset($desc[$net]);
+			$this->setConfig("descriptions", $desc, "network");
+		}
 		return $this->runHook("removenetwork", array("network" => $net, "zone" => $zone));
 	}
 
-	public function addNetworkToZone($net = false, $zone = false) {
+	public function addNetworkToZone($net = false, $zone = false, $descr = "") {
 		$net = trim($net);
 		if (!$net) {
 			// Someone clicked on an empty box..
@@ -792,7 +876,7 @@ class Firewall extends \FreePBX_Helpers implements \BMO {
 			$ip = 6;
 		} else {
 			// It's probably a host. Add it to our host maps to care about later
-			return $this->addHostToZone($net, $zone);
+			return $this->addHostToZone($net, $zone, $descr);
 		}
 
 		// Check subnet.. 
@@ -815,12 +899,26 @@ class Firewall extends \FreePBX_Helpers implements \BMO {
 		$nets["$addr/$subnet"] = $zone;
 		$this->setConfig("networkmaps", $nets);
 
+		// Update our description, if needed
+		if ($descr) {
+			$descriptions = $this->getConfig("descriptions", "network");
+			if (!is_array($descriptions)) {
+				$descriptions = array("$addr/$subnet" => $descr);
+			} else {
+				$descriptions["$addr/$subnet"] = $descr;
+			}
+			$this->setConfig("descriptions", $descriptions, "network");
+		}
 		$params = array($zone => array("$addr/$subnet"));
 		return $this->runHook("addnetwork", $params);
 	}
 
-	public function addHostToZone($host, $zone) {
+	public function addHostToZone($host, $zone, $descr = "") {
 		$host = trim($host);
+		if (!$host) {
+			throw new \Exception("Can't add empty host");
+		}
+
 		$hosts = $this->getConfig("hostmaps");
 		if (!is_array($hosts)) {
 			$hosts = array();
@@ -835,11 +933,24 @@ class Firewall extends \FreePBX_Helpers implements \BMO {
 		$nets[$host] = $zone;
 		$this->setConfig("networkmaps", $nets);
 
+		// Update our description, if needed
+		if ($descr) {
+			$descriptions = $this->getConfig("descriptions", "network");
+			if (!is_array($descriptions)) {
+				$descriptions = array($host => $descr);
+			} else {
+				$descriptions[$host] = $descr;
+			}
+			$this->setConfig("descriptions", $descriptions, "network");
+		}
 		return $this->setConfig("hostmaps", $hosts);
 	}
 
-	public function changeNetworksZone($net, $zone) {
+	public function changeNetworksZone($net, $zone, $descr = "") {
 		$net = trim($net);
+		if (!$net) {
+			throw new \Exception("Can't add empty net");
+		}
 
 		// Get our current maps...
 		$nets = $this->getConfig("networkmaps");
@@ -864,7 +975,19 @@ class Firewall extends \FreePBX_Helpers implements \BMO {
 		$nets[$net] = $zone;
 		$this->setConfig("networkmaps", $nets);
 
-		return $this->runHook("changenetwork", array("network" => $net, "newzone" => $zone));
+		// Update our description, if needed
+		if ($descr) {
+			$descriptions = $this->getConfig("descriptions", "network");
+			if (!is_array($descriptions)) {
+				$descriptions = array($net => $descr);
+			} else {
+				$descriptions[$net] = $descr;
+			}
+			$this->setConfig("descriptions", $descriptions, "network");
+		}
+
+		// Disable hook
+		// return $this->runHook("changenetwork", array("network" => $net, "newzone" => $zone));
 	}
 
 	// Add RFC1918 addresses to the trusted zone
@@ -929,17 +1052,65 @@ class Firewall extends \FreePBX_Helpers implements \BMO {
 		if (!is_array($nets)) {
 			return false;
 		}
+
+		// Discover the IP, and guess the network, of the remote client.
 		$thisnet = $this->detectNetwork();
 		$thishost = $this->detectHost();
+
 		foreach ($nets as $n => $zone) {
 			if ($zone !== "trusted") {
 				continue;
 			}
-			if ($n === $thisnet || $n === $thishost) {
+
+			if ($n === $thishost || $n === $thisnet) {
+				return true;
+			}
+
+			if ($this->inRange($thishost, $n)) {
 				return true;
 			}
 		}
 		return false;
+	}
+
+	public function inRange($ipnet, $range) {
+			$tmparr = explode("/", $range);
+			$network = $tmparr[0];
+			if (!isset($tmparr[1])) {
+				$cidr = "32";
+			} else {
+				$cidr = $tmparr[1];
+			}
+
+			// Our Base CIDR is what is handed to us by detectHost, and from that
+			// we can tell what we need to match against.
+			list ($ip, $basecidr) = explode("/", $ipnet);
+
+			// If it's a single host, it's a simple check.
+			if ($cidr === "32" || $cidr === "128") {
+				if ($network === $ip) {
+					return true;
+				} else {
+					return false;
+				}
+			}
+
+			// If its ipv6, this needs to be reworked, using net_pton to replace ip2long.
+			if ($cirt === "128") {
+				return false;
+			} else {
+				// IPv4: Convert our IPs to decimals for bitwise operations
+				$ip_dec = ip2long($ip);
+				$net_dec = ip2long($network);
+
+				// Create our bitmap. This creates 1's of the CIDR, 00000000.00000000.00000000.11111111
+				$wildcard = pow( 2, ( $basecidr - $cidr ) ) - 1;
+				// This inverts it, so it's 11111111.11111111.11111111.00000000
+				$netmask = ~ $wildcard;
+
+				// Now, if the relevant bits of the NETWORK match the relevant bits of the HOST, we're good!
+				return ( ( $ip_dec & $netmask ) == ( $net_dec & $netmask ) );
+			}
 	}
 
 	public function rfcNetsAdded() {
@@ -1034,25 +1205,6 @@ class Firewall extends \FreePBX_Helpers implements \BMO {
 		$this->setConfig($host, false, "blacklist");
 	}
 
-	public function isSafemodeEnabled() {
-		$ena = $this->getConfig("safemodeenabled");
-		if ($ena == false || $ena == "enabled") {
-			return true;
-		} else {
-			return false;
-		}
-	}
-
-	public function disableSafemode() {
-		$this->setConfig("safemodeenabled", "disabled");
-		return "disabled";
-	}
-
-	public function enableSafemode() {
-		$this->setConfig("safemodeenabled", "enabled");
-		return "enabled";
-	}
-
 	public function genUUID() {
 		// This generates a v4 GUID
 
@@ -1063,6 +1215,64 @@ class Firewall extends \FreePBX_Helpers implements \BMO {
 		$data[8] = chr(ord($data[8]) & 0x3f | 0x80); // set bits 6-7 to 10
 
 		return vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($data), 4));
+	}
+
+	public function getAdvancedSettings() {
+		$defaults = array("safemode" => "enabled", "masq" => "enabled", "customrules" => "disabled", "rejectpackets" => "disabled");
+		$settings = $this->getConfig("advancedsettings");
+		if (!is_array($settings)) {
+			$settings = $defaults;
+			$this->setConfig("advancedsettings", $settings);
+		}
+
+		// Only return the keys we should return.
+		$retarr = array();
+		foreach ($defaults as $k => $v) {
+			if (!isset($settings[$k])) {
+				$retarr[$k] = $v;
+			} else {
+				$retarr[$k] = $settings[$k];
+			}
+		}
+		return $retarr;
+	}
+
+	public function setAdvancedSetting($setting, $val) {
+		$current = $this->getAdvancedSettings();
+		if (!isset($current[$setting])) {
+			throw new \Exception("$setting is not an advanced setting");
+		}
+		if ($current[$setting] !== trim($val)) {
+			$current[$setting] = trim($val);
+			$this->setConfig("advancedsettings", $current);
+		}
+		return $current;
+	}
+
+	// Create a cron job that runs every 15 mins that tries to restart firewall
+	// if it's not running when it should be.
+	public function addCronJob() {
+		$cron = \FreePBX::Cron();
+		$hookfile = "/var/spool/asterisk/incron/firewall.firewall";
+		$line = "*/15 * * * * [ -e /etc/asterisk/firewall.enabled ] && touch $hookfile";
+		$cron->add($line);
+	}
+
+	public function removeCronJob() {
+		$cron = \FreePBX::Cron();
+		$hookfile = "/var/spool/asterisk/incron/firewall.firewall";
+		$line = "*/15 * * * * [ -e /etc/asterisk/firewall.enabled ] && touch $hookfile";
+		$cron->remove($line);
+	}
+
+	// Hooks
+	public function getNameHooks($names) {
+		$newnames = \FreePBX::Hooks()->processHooks($names);
+		if ($newnames) {
+			return $newnames;
+		} else {
+			return $names;
+		}
 	}
 }
 

@@ -20,14 +20,14 @@ $s = stat($thisphar);
 $startup['mtime'] = $s['mtime'];
 
 // Create the Validator object
-require '/usr/lib/sysadmin/includes.php';
+include_once '/usr/lib/sysadmin/includes.php';
 $g = new \Sysadmin\GPG();
 $sigfile = \Sysadmin\FreePBX::Config()->get('AMPWEBROOT')."/admin/modules/firewall/module.sig";
 $sig = $g->checkSig($sigfile);
 if (!isset($sig['config']['hash']) || $sig['config']['hash'] !== "sha256") {
 	throw new \Exception("Invalid sig file.. Hash is not sha256 - check $sigfile");
 }
-require 'validator.php';
+include_once 'validator.php';
 $v = new \FreePBX\modules\Firewall\Validator($sig); // Global
 
 // Grab the driver for this machine
@@ -73,6 +73,7 @@ function fwLog($str) {
 	$lfstat = @stat("/tmp/firewall.log");
 	if (is_array($lfstat) && $lfstat['size'] > 1048576) {
 		// Logfile is over 1mb
+		print time().": Rotating Log\n";
 		@unlink("/tmp/firewall.log.old");
 		rename("/tmp/firewall.log", "/tmp/firewall.log.old");
 		// This is so hacky.
@@ -80,11 +81,15 @@ function fwLog($str) {
 			fclose($STDIN);
 			fclose($STDOUT);
 			fclose($STDERR);
-			$STDIN = fopen('/dev/null', 'r');
-			$STDOUT = fopen('/tmp/firewall.log', 'ab');
-			$STDERR = fopen('/tmp/firewall.err', 'ab');
+		} else {
+			fclose(STDIN);
+			fclose(STDOUT);
+			fclose(STDERR);
 		}
-		print "Rotated Log\n";
+		$STDIN = fopen('/dev/null', 'r');
+		$STDOUT = fopen('/tmp/firewall.log', 'ab');
+		$STDERR = fopen('/tmp/firewall.err', 'ab');
+		print time().": Rotated Log\n";
 	}
 	print time().": $str\n";
 	// No need to write to the logfile, as we're sending it there already by the print
